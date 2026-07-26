@@ -136,52 +136,149 @@ GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA bl_demat
 Power Automate **ne fonctionne pas** — le Flow bot rejette la carte avec
 « One or more mention entity could not be found in card text », ou affiche le
 nom sans le rendre cliquable. La seule méthode fiable est l'action Teams
-**« Obtenir un jeton @mention pour un utilisateur »** : elle prend l'**e-mail**
-de la personne (surtout pas son AAD Object ID) et renvoie un jeton que le
-Flow bot transforme lui-même en vraie mention.
+**« Obtenir un jeton @mention pour un utilisateur »** : elle renvoie un jeton
+que le Flow bot transforme lui-même en vraie mention.
 
-L'application est déjà prête pour cela (`BL_TEAMS_MENTION_MODE=flow`) : elle
-envoie, à la racine de la charge utile, un tableau `mentions` avec les
-e-mails des gestionnaires, et place le marqueur `{{MENTIONS}}` dans la carte.
-**Il reste à faire remplacer ce marqueur par le flux** — sans toucher au
-schéma du déclencheur.
+Cette action **échoue si la personne n'est pas membre de l'équipe**, et son
+échec fait échouer tout le flux — donc aussi la notification. Le flux
+ci-dessous évite ce piège : il **liste les membres réels de l'équipe** et ne
+demande un jeton que pour ceux qui figurent dans les e-mails envoyés par
+l'application. Un gestionnaire absent du canal est simplement ignoré ; la
+carte part quand même.
 
-#### Modification du flux (5 actions à ajouter)
+L'application est déjà prête (`BL_TEAMS_MENTION_MODE=flow`) : elle envoie, à
+la racine de la charge utile, un tableau `mentions` contenant les e-mails des
+gestionnaires **en minuscules**, et place le marqueur `{{MENTIONS}}` dans la
+carte, à l'endroit exact où les mentions doivent apparaître :
+
+```json
+{
+  "type": "message",
+  "mentions": ["marie.durand@emotors.com", "paul.martin@emotors.com"],
+  "attachments": [{ "contentType": "application/vnd.microsoft.card.adaptive",
+                    "content": { "...": "… Gestionnaire(s) : {{MENTIONS}} …" } }]
+}
+```
+
+`mentions` est **toujours** présent — vide pour la MessageCard « EDI NOK →
+OK » ou pour une réception sans gestionnaire.
+
+#### Convention préalable : renommer les actions
+
+Les expressions référencent les actions par leur nom, apostrophes doublées et
+espaces remplacés par `_` : `body('Répertorier_les_membres_de_l''équipe')` est
+illisible et source d'erreurs. **Renommez chaque action ajoutée** (⋯ ▸
+*Renommer*) avec les noms ASCII utilisés ci-dessous. Toutes les expressions du
+guide en dépendent.
+
+#### Modification du flux (6 actions à ajouter)
 
 Power Automate ▸ Mes flux ▸ *Envoyer des alertes webhook à …* ▸ **Modifier**.
+Les actions 1 à 5 se placent **après le déclencheur et avant** l'action
+« Publier une carte dans un chat ou un canal » (donc avant la boucle sur les
+pièces jointes, si le modèle en comporte une).
 
-1. **Après le déclencheur**, ajouter *Initialiser une variable* :
-   - Nom : `JetonsMentions` · Type : **Chaîne** · Valeur : *(vide)*
+**1. Initialiser une variable** — nom `JetonsMentions`
 
-2. Ajouter *Appliquer à chacun* :
-   - Entrée (mode expression) : `triggerBody()?['mentions']`
-   > Le schéma du déclencheur n'a pas besoin de déclarer `mentions` : une
-   > expression lit toujours le corps **brut** de la requête.
+| Champ | Valeur |
+|---|---|
+| Nom | `JetonsMentions` |
+| Type | **Chaîne** |
+| Valeur | *(vide)* |
 
-3. **Dans** cette boucle, ajouter l'action Teams
-   **« Obtenir un jeton @mention pour un utilisateur »** :
-   - *Utilisateur* : `item()` (l'e-mail courant)
+**2. Teams ▸ « Répertorier les membres de l'équipe »** — renommer `Membres`
 
-4. Toujours dans la boucle, ajouter *Ajouter à la variable chaîne* :
-   - Nom : `JetonsMentions`
-   - Valeur : la sortie de l'action précédente (**@mention token**), suivie
-     d'un espace
+| Champ | Valeur |
+|---|---|
+| Équipe | l'équipe qui contient le canal de notification |
 
-5. Dans l'action **« Publier une carte dans un chat ou un canal »** déjà
-   présente, remplacer le contenu du champ *Corps du message* par
-   l'expression :
+> Sortie utile : `body('Membres')?['value']`, un tableau d'objets contenant
+> `displayName`, `userPrincipalName`, `email`, `userId`. Faites un premier
+> **Test** du flux et regardez la sortie brute de cette action pour confirmer
+> les noms de champs de votre tenant — les expressions ci-dessous utilisent un
+> `coalesce` qui accepte `userPrincipalName` **ou** `email`, ce qui couvre les
+> deux cas.
 
-   ```
-   json(replace(string(item()?['content']), '{{MENTIONS}}', variables('JetonsMentions')))
-   ```
+**3. « Filtrer un tableau »** — renommer `Gestionnaires`
 
-   > Dans la branche « si les pièces jointes sont nulles », l'expression
-   > équivalente est :
-   > `json(replace(string(variables('Body')), '{{MENTIONS}}', variables('JetonsMentions')))`
+| Champ | Valeur |
+|---|---|
+| De | `body('Membres')?['value']` |
 
-6. **Enregistrer**, créer un BL de test : le nom du gestionnaire doit
-   maintenant apparaître en mention cliquable, et la personne reçoit une
-   notification Teams.
+Condition : basculer en **mode avancé** (bouton *Modifier en mode avancé*) et
+coller :
+
+```
+@contains(
+  coalesce(triggerBody()?['mentions'], createArray()),
+  toLower(coalesce(item()?['userPrincipalName'], item()?['email'], ''))
+)
+```
+
+> Ne garde que les membres de l'équipe dont l'e-mail figure dans la charge
+> utile. `toLower` est indispensable : `contains` est sensible à la casse et
+> Teams renvoie souvent l'UPN avec des majuscules. C'est pour cette raison que
+> l'application envoie les e-mails déjà en minuscules.
+>
+> Le `coalesce` sur `triggerBody()?['mentions']` évite l'erreur *« expression
+> … is of type 'Null' »* sur les charges sans mentions.
+
+**4. « Appliquer à chacun »** — renommer `PourChaqueGestionnaire`
+
+| Champ | Valeur |
+|---|---|
+| Sélectionner une sortie | `body('Gestionnaires')` |
+
+> La sortie d'un *Filtrer un tableau* **est** le tableau : pas de `?['value']`
+> ici. Un tableau vide fait simplement zéro itération.
+
+**5a. Dans la boucle — Teams ▸ « Obtenir un jeton @mention pour un
+utilisateur »** — renommer `Jeton`
+
+| Champ | Valeur |
+|---|---|
+| Utilisateur | `coalesce(item()?['userPrincipalName'], item()?['email'])` |
+
+**5b. Toujours dans la boucle — « Ajouter à la variable chaîne »**
+
+| Champ | Valeur |
+|---|---|
+| Nom | `JetonsMentions` |
+| Valeur | `concat(outputs('Jeton')?['body/atMention'], ' ')` |
+
+> L'espace final sépare les mentions successives.
+
+**6. Dans « Publier une carte dans un chat ou un canal »**, remplacer le
+contenu du champ *Corps du message* (carte adaptative) par :
+
+```
+json(replace(string(item()?['content']), '{{MENTIONS}}', trim(variables('JetonsMentions'))))
+```
+
+> `item()` désigne ici la pièce jointe courante, dans la boucle du modèle
+> d'origine. Si votre flux passe l'objet complet, l'équivalent direct est :
+> `json(replace(string(triggerOutputs()?['body/attachments'][0]?['content']), '{{MENTIONS}}', trim(variables('JetonsMentions'))))`
+>
+> Dans la branche « si les pièces jointes sont nulles » (MessageCard EDI) :
+> `json(replace(string(variables('Body')), '{{MENTIONS}}', trim(variables('JetonsMentions'))))`
+> — cette carte ne contient pas le marqueur, le `replace` est donc sans effet.
+
+**7. Enregistrer**, puis créer une réception de test : le nom du gestionnaire
+doit apparaître en mention cliquable et la personne reçoit une notification
+Teams personnelle.
+
+#### Ordre final du flux
+
+```
+Déclencheur : requête webhook Teams
+├─ Initialiser JetonsMentions (chaîne, vide)
+├─ Membres            → Répertorier les membres de l'équipe
+├─ Gestionnaires      → Filtrer un tableau (membres ∩ mentions)
+├─ PourChaqueGestionnaire (sur body('Gestionnaires'))
+│   ├─ Jeton          → Obtenir un jeton @mention
+│   └─ Ajouter à JetonsMentions : concat(jeton, ' ')
+└─ Publier une carte  → {{MENTIONS}} remplacé par JetonsMentions
+```
 
 #### Vérifier / diagnostiquer
 
@@ -191,13 +288,20 @@ Teams** : la carte de test publie quatre lignes — la n° 1 utilise la méthode
 l'application. **Seule la ligne réellement cliquable compte.** En principe
 c'est la n° 1 une fois le flux modifié.
 
-Rappels :
+Points d'attention :
 
-- L'action exige l'**e-mail** ; le champ *Teams ID* du référentiel ne sert
-  qu'au mode `entities`, à ne conserver que s'il fonctionne chez vous.
+- L'e-mail saisi dans Gestion ▸ Gestionnaires doit être celui du **compte
+  Microsoft 365** (UPN), pas un alias.
+- La personne doit être **membre de l'équipe** ; sinon elle est filtrée
+  silencieusement (pas de mention, mais pas d'échec non plus).
+- « Répertorier les membres de l'équipe » est **paginée** : sur une grande
+  équipe, activer *Paramètres ▸ Pagination* de l'action et monter le seuil,
+  sinon un gestionnaire au-delà de la première page ne serait jamais trouvé.
 - Seuls les blocs **TextBlock** et **FactSet** affichent une mention dans une
   carte adaptative.
-- La personne doit être **membre de l'équipe/du canal**.
+- Si le marqueur reste vide, la ligne affiche « Gestionnaire(s) : » sans nom.
+  Pour un repli explicite, remplacer `trim(variables('JetonsMentions'))` par
+  `if(empty(trim(variables('JetonsMentions'))), '—', trim(variables('JetonsMentions')))`.
 - Si vous ne pouvez pas modifier le flux du tout : passer
   `BL_TEAMS_MENTION_MODE` à `texte` — les gestionnaires sont alors cités en
   clair, sans notification personnelle.
@@ -308,7 +412,10 @@ sont journalisés en base, simplement pas publiés dans Teams.
 | Situation | Où regarder / que faire |
 |---|---|
 | Une notification n'est pas arrivée | Gestion ▸ **Notifications** : colonne « Envoyée » et « Erreur ». Une erreur réseau ou HTTP y est explicite. |
-| Une mention n'est pas cliquable | Voir « Rendre les mentions cliquables » (§2.6) : schéma du déclencheur, puis Teams ID (AAD Object ID) dans Gestion ▸ Gestionnaires, puis appartenance au canal. |
+| Une mention n'est pas cliquable | Voir « Rendre les mentions cliquables » : le flux doit produire les jetons (action « Obtenir un jeton @mention »), l'e-mail doit être renseigné dans Gestion ▸ Gestionnaires, et la personne être membre du canal. |
+| Le flux échoue : *'foreach' expression … is of type 'Null'* | Une expression boucle directement sur `triggerBody()?['mentions']`. L'envelopper dans `coalesce(…, createArray())` : certaines cartes (EDI NOK → OK, réception sans gestionnaire) n'ont pas de mentions. |
+| Le flux échoue sur *Obtenir un jeton @mention* | La personne n'est pas membre de l'équipe. Le filtre `Gestionnaires` doit s'intercaler avant la boucle (voir « Rendre les mentions cliquables ») pour l'écarter au lieu de faire échouer le flux. |
+| Un gestionnaire n'est jamais mentionné | Son e-mail dans Gestion ▸ Gestionnaires n'est pas son UPN Microsoft 365, ou il dépasse la première page de « Répertorier les membres de l'équipe » (activer la pagination de l'action). |
 | Personne n'est mentionné | Le fournisseur n'a pas de gestionnaire dans Gestion ▸ **Portefeuilles**. |
 | L'IA ne pré-remplit plus | `BL_LLM_ENDPOINT` vide, ou ressource *Serving endpoint* absente / sans « Can query ». Le détail de l'erreur est affiché à l'étape 3. |
 | « Ressource Lakebase absente » | La ressource Database n'est pas attachée à l'app (clé `postgres`). |
