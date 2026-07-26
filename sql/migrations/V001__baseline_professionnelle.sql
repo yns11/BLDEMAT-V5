@@ -296,6 +296,6 @@ ON CONFLICT DO NOTHING;
 INSERT INTO {{schema}}.notification_canaux
   (code, actif, type_canal, secret_scope, secret_key)
 VALUES
-  ('TEAMS', false, 'TEAMS', 'bldemat', 'teams-webhook-url'),
+  ('TEAMS', true, 'TEAMS', 'bldemat', 'teams-webhook-url'),
   ('POWER_AUTOMATE', false, 'POWER_AUTOMATE', 'bldemat', 'power-automate-url')
 ON CONFLICT (code) DO NOTHING;
